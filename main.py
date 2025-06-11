@@ -20,8 +20,15 @@ from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
-import firebase_admin
-from firebase_admin import credentials, firestore, auth
+# --- Pre-App Logging ---
+print("LOG: main.py script execution started.")
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore, auth
+    print("LOG: Firebase libraries imported successfully.")
+except ImportError as e:
+    print(f"CRITICAL IMPORT ERROR: {e}")
 
 # --- Global variable for Firestore client ---
 db = None
@@ -46,16 +53,17 @@ async def lifespan(app: FastAPI):
     yield
     print("SHUTDOWN: Application is shutting down.")
 
+
 # --- FastAPI App Definition ---
-app = FastAPI(title="Mail Sender by ROS", version="6.1.0", lifespan=lifespan)
+app = FastAPI(title="Mail Sender by ROS", version="6.2.0", lifespan=lifespan)
 print("LOG: FastAPI app object created.")
 
 # --- Constants & Config ---
 APP_PREFIX = "BULKMAILER"
 SECRET_KEY = "R@O#S"
 TRIAL_MAX_EMAILS = 50
-ARTIFACTS_COLLECTION = "artifacts"
-BACKEND_APP_ID = "mail_sender_ros_backend_app_id"
+ARTIFACTS_COLLECTION = "artifacts" 
+BACKEND_APP_ID = "mail_sender_ros_backend_app_id" 
 USER_DATA_SUBCOLLECTION = "userAppData"
 LICENSE_DOC_ID = "license"
 CONSUMED_CODES_DOC_ID = "consumedCodes"
@@ -63,9 +71,16 @@ APP_CONFIG_DOC_ID = "appConfig"
 TRIAL_DATA_COLLECTION = "trials"
 
 # --- CORS Middleware ---
-origins = ["http://localhost", "http://localhost:8000", "http://127.0.0.1:8000", "https://mailsenderbyros2.web.app"]
+# ** THIS IS THE FIX **
+# We ensure the live frontend URL is included here.
+origins = [
+    "http://localhost",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "https://mailsenderbyros2.web.app", # Your live Firebase frontend
+]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-print("LOG: CORS middleware configured.")
+print(f"LOG: CORS middleware configured for origins: {origins}")
 
 # --- Pydantic Models ---
 class User(BaseModel): uid: str; email: Optional[EmailStr] = None
@@ -76,9 +91,6 @@ class SendingParams(BaseModel): batchSize: int = 10; delay: float = 5.0; subject
 class AppConfig(BaseModel): emailAccounts: List[EmailAccount] = Field(default_factory=list, alias="emailAccounts"); subjectLines: List[str] = Field(default_factory=list, alias="subjectLines"); sendingParams: SendingParams = Field(default_factory=SendingParams, alias="sendingParams")
 class Recipient(BaseModel): id: str; sl_no: int; Email: EmailStr; FirstName: Optional[str] = ""; CompanyName: Optional[str] = ""; STATUS: Optional[str] = "Pending"
 class CampaignRequest(BaseModel): selected_accounts: List[str]; selected_subjects: List[str]; recipients: List[Recipient]; email_body_template: str; sending_params: SendingParams
-
-# ** THIS IS THE FIX **
-# The TrialCampaignRequest now correctly expects a list of EmailAccount objects, not strings.
 class TrialCampaignRequest(BaseModel):
     selected_accounts: List[EmailAccount]
     selected_subjects: List[str]
@@ -102,7 +114,7 @@ async def get_current_user(request: Request) -> User:
         return User(uid=uid, email=decoded_token.get("email"))
     except Exception as e: raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
-# ... (The rest of your service classes remain the same) ...
+# ... (The rest of your service classes and utility functions remain the same) ...
 def spin(text: str) -> str:
     pattern = re.compile(r'{([^{}]*)}')
     while True:
@@ -125,7 +137,7 @@ class LicenseService:
         if doc.exists: return LicenseStatus(**doc.to_dict())
         return LicenseStatus(status="TRIAL", plan="TRIAL", emails_sent_trial=0)
     def _validate_activation_code_structure(self, code_str: str) -> tuple[bool, Any]:
-        parts = code_str.strip().split('-');
+        parts = code_str.strip().split('-')
         if len(parts) != 4: return False, "Invalid format"
         prefix, plan_key, encoded_payload, checksum_from_code = parts
         if prefix != APP_PREFIX: return False, "Invalid prefix"
@@ -165,12 +177,15 @@ class ConfigService:
 
 class EmailService:
     def _log_to_console(self, user_id: str, message: str): print(f"UID/TrialID: {user_id} Campaign: {message}")
-    async def _process_campaign_in_background(self, req: CampaignRequest, user_id_or_trial_id: str, db_client: Any, is_trial: bool = False):
+    async def _process_campaign_in_background(self, req: Any, user_id_or_trial_id: str, db_client: Any, is_trial: bool):
         self._log_to_console(user_id_or_trial_id, "BG processing started.")
         # ... (full email sending logic from previous version) ...
         self._log_to_console(user_id_or_trial_id, "BG processing finished.")
     async def start_send_bulk_emails(self, req: CampaignRequest, uid: str, license_service: LicenseService, db_client, bg_tasks: BackgroundTasks):
-        # ...
+        license_status = await license_service.get_license_status(uid, db_client)
+        if license_status.status == "TRIAL" and license_status.emails_sent_trial >= TRIAL_MAX_EMAILS:
+             raise HTTPException(status_code=403, detail="Trial email limit reached on your activated account.")
+        bg_tasks.add_task(self._process_campaign_in_background, req, uid, db_client, is_trial=False)
         return {"message": "Email campaign started for activated user."}
     async def start_trial_send(self, req: TrialCampaignRequest, db_client, bg_tasks: BackgroundTasks):
         trial_doc_ref = db_client.collection(TRIAL_DATA_COLLECTION).document(req.trial_id)
