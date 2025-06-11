@@ -26,8 +26,7 @@ print("LOG: main.py script execution started.")
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore, auth
-    from google.cloud import secretmanager
-    print("LOG: All major libraries imported successfully.")
+    print("LOG: Firebase libraries imported successfully.")
 except ImportError as e:
     print(f"CRITICAL IMPORT ERROR: {e}")
 
@@ -41,24 +40,19 @@ async def lifespan(app: FastAPI):
     print("STARTUP: Lifespan event triggered.")
     try:
         if not firebase_admin._apps:
-            print("STARTUP: Initializing Firebase...")
-            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-            if not project_id:
-                raise ValueError("CRITICAL_ERROR: GOOGLE_CLOUD_PROJECT env var not found.")
+            print("STARTUP: Initializing Firebase Admin SDK...")
             
-            print(f"STARTUP: Project ID: {project_id}")
-            client = secretmanager.SecretManagerServiceClient()
-            name = f"projects/{project_id}/secrets/firebase-service-account-key/versions/latest"
+            # The GOOGLE_APPLICATION_CREDENTIALS env var will be set in Render's dashboard.
+            # It will point to the secret file we uploaded.
+            if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+                print("STARTUP: Found GOOGLE_APPLICATION_CREDENTIALS. Initializing with file.")
+                firebase_admin.initialize_app()
+            else:
+                # This is a fallback in case the env var isn't set, but it shouldn't be used on Render.
+                print("STARTUP_WARNING: GOOGLE_APPLICATION_CREDENTIALS not found. Attempting default init.")
+                firebase_admin.initialize_app()
             
-            print(f"STARTUP: Accessing secret: {name}")
-            response = client.access_secret_version(name=name)
-            
-            creds_dict = json.loads(response.payload.data.decode("UTF-8"))
-            print("STARTUP: Credentials fetched.")
-            
-            cred = credentials.Certificate(creds_dict)
-            firebase_admin.initialize_app(cred, {'projectId': project_id})
-            print("STARTUP: Firebase Admin SDK initialized.")
+            print("STARTUP: Firebase Admin SDK initialized successfully.")
         
         db = firestore.client()
         print("STARTUP: Firestore client is ready.")
@@ -68,11 +62,11 @@ async def lifespan(app: FastAPI):
         db = None
     
     yield
-    print("SHUTDOWN: Application shutting down.")
+    print("SHUTDOWN: Application is shutting down.")
 
 
 # --- FastAPI App Definition ---
-app = FastAPI(title="Mail Sender by ROS", version="4.1.0", lifespan=lifespan)
+app = FastAPI(title="Mail Sender by ROS", version="5.0.0", lifespan=lifespan)
 print("LOG: FastAPI app object created.")
 
 # --- Constants & Config ---
@@ -96,20 +90,9 @@ class User(BaseModel): uid: str; email: Optional[EmailStr] = None
 class ActivationRequest(BaseModel): activation_code: str
 class LicenseStatus(BaseModel): status: str; plan: str; expiry_date: Optional[str] = None; activation_date: Optional[str] = None; emails_sent_trial: int; activated_email: Optional[str] = None
 
-# ** THIS IS THE FIX **
-# Using Field(default_factory=...) is the correct way to generate a default value for each new instance.
 class EmailAccount(BaseModel): 
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    account_name: str
-    email: EmailStr
-    password: str
-    sender_name: Optional[str] = ""
-    smtp_server: str
-    smtp_port: int
-    connection_type: str
-    use_ssl: bool = False
-    use_starttls: bool = True
-    signature_html: Optional[str] = ""
+    account_name: str; email: EmailStr; password: str; sender_name: Optional[str] = ""; smtp_server: str; smtp_port: int; connection_type: str; use_ssl: bool = False; use_starttls: bool = True; signature_html: Optional[str] = ""
 
 class SendingParams(BaseModel): batchSize: int = 10; delay: float = 5.0; subjectRotation: int = 10; emailsPerAccount: int = 5
 class AppConfig(BaseModel): emailAccounts: List[EmailAccount] = Field(default_factory=list, alias="emailAccounts"); subjectLines: List[str] = Field(default_factory=list, alias="subjectLines"); sendingParams: SendingParams = Field(default_factory=SendingParams, alias="sendingParams")
@@ -122,26 +105,6 @@ async def get_db():
     return db
 
 # ... (The rest of your service classes and endpoints remain the same as the previous version) ...
-
-# --- Utility Functions ---
-def spin(text: str) -> str:
-    pattern = re.compile(r'{([^{}]*)}')
-    while True:
-        match = pattern.search(text)
-        if not match: break
-        options = match.group(1).split('|')
-        selected_option = random.choice(options)
-        text = text[:match.start()] + selected_option + text[match.end():]
-    return text
-
-def _calculate_checksum(data_string: str) -> str:
-    hasher = hashlib.sha256()
-    hasher.update((data_string + SECRET_KEY).encode('utf-8'))
-    return hasher.hexdigest()[:8].upper()
-
-def _hash_full_code(code_str: str) -> str:
-    return hashlib.sha256(code_str.encode('utf-8')).hexdigest()
-
 async def get_current_user(request: Request) -> User:
     authorization: str = request.headers.get("Authorization")
     if not authorization or not authorization.startswith("Bearer "): raise HTTPException(status_code=401, detail="Not authenticated")
@@ -153,7 +116,6 @@ async def get_current_user(request: Request) -> User:
         return User(uid=uid, email=decoded_token.get("email"))
     except Exception as e: raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
-# --- Service Layer ---
 class LicenseService:
     def _get_user_license_doc_ref(self, user_id: str, db_client): return db_client.collection(ARTIFACTS_COLLECTION).document(BACKEND_APP_ID).collection("users").document(user_id).collection(USER_DATA_SUBCOLLECTION).document(LICENSE_DOC_ID)
     def _get_consumed_codes_doc_ref(self, db_client): return db_client.collection(ARTIFACTS_COLLECTION).document(BACKEND_APP_ID).collection(USER_DATA_SUBCOLLECTION).document(CONSUMED_CODES_DOC_ID)
@@ -203,8 +165,8 @@ class ConfigService:
 class EmailService:
     def _log_to_console(self, user_id: str, message: str): print(f"UID {user_id} Campaign: {message}")
     async def _process_campaign_in_background(self, req: CampaignRequest, uid: str, license_service: LicenseService, db_client: Any):
+        # ... (full email sending logic would be here) ...
         self._log_to_console(uid, "Background email campaign processing started.")
-        # ... (Email sending logic from previous version) ...
         self._log_to_console(uid, "Campaign processing finished.")
     async def start_send_bulk_emails(self, req: CampaignRequest, uid: str, license_service: LicenseService, db_client, bg_tasks: BackgroundTasks):
         bg_tasks.add_task(self._process_campaign_in_background, req, uid, license_service, db_client)
