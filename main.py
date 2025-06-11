@@ -1,4 +1,4 @@
-# main.py - FINAL FIX (Corrects Synchronous Database Calls)
+# main.py - FINAL FIX (Corrects Endpoints and Adds Real-time Firestore Updates)
 
 import os
 import json
@@ -36,39 +36,52 @@ async def lifespan(app: FastAPI):
     try:
         if not firebase_admin._apps:
             print("STARTUP: Initializing Firebase Admin SDK...")
-            if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
-                raise ValueError("CRITICAL_ERROR: GOOGLE_APPLICATION_CREDENTIALS env var not found.")
-            firebase_admin.initialize_app()
+            # Using a service account file is more common for Render deployments
+            service_account_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+            if not service_account_path or not os.path.exists(service_account_path):
+                 raise ValueError("CRITICAL_ERROR: GOOGLE_APPLICATION_CREDENTIALS env var not found or file does not exist.")
+            
+            cred = credentials.Certificate(service_account_path)
+            firebase_admin.initialize_app(cred)
             print("STARTUP: Firebase Admin SDK initialized successfully.")
+        
         db = firestore.client()
         print("STARTUP: Firestore client is ready.")
     except Exception as e:
         print(f"CRITICAL STARTUP ERROR: {e}")
-        db = None
+        db = None # Ensure db is None if initialization fails
     yield
     print("SHUTDOWN: Application is shutting down.")
 
 
 # --- FastAPI App Definition ---
-app = FastAPI(title="Mail Sender by ROS", version="7.5.0", lifespan=lifespan)
+app = FastAPI(title="Mail Sender by ROS", version="8.0.0", lifespan=lifespan)
 print("LOG: FastAPI app object created.")
 
 # --- Constants & Config ---
 APP_PREFIX = "BULKMAILER"
 SECRET_KEY = "R@O#S"
 TRIAL_MAX_EMAILS = 50
-ARTIFACTS_COLLECTION = "artifacts" 
-BACKEND_APP_ID = "mail_sender_ros_backend_app_id" 
+ARTIFACTS_COLLECTION = "artifacts"
+BACKEND_APP_ID = "mail_sender_ros_backend_app_id"
 USER_DATA_SUBCOLLECTION = "userAppData"
 LICENSE_DOC_ID = "license"
 CONSUMED_CODES_DOC_ID = "consumedCodes"
 APP_CONFIG_DOC_ID = "appConfig"
 TRIAL_DATA_COLLECTION = "trials"
+CAMPAIGN_COLLECTION = "campaigns" # Collection for real-time updates
 
 # --- CORS Middleware ---
-origins = ["http://localhost", "http://localhost:8000", "http://127.0.0.1:8000", "https://mailsenderbyros2.web.app"]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-print(f"LOG: CORS middleware configured for origins: {origins}")
+# Allow all origins for broader compatibility, especially with dynamic preview URLs.
+# For production, it's better to restrict this to your actual frontend URL.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods
+    allow_headers=["*"], # Allows all headers
+)
+print("LOG: CORS middleware configured to allow all origins.")
 
 # --- Pydantic Models ---
 class User(BaseModel): uid: str; email: Optional[EmailStr] = None
@@ -76,8 +89,9 @@ class ActivationRequest(BaseModel): activation_code: str
 class LicenseStatus(BaseModel): status: str; plan: str; expiry_date: Optional[str] = None; activation_date: Optional[str] = None; emails_sent_trial: int; activated_email: Optional[str] = None
 class EmailAccount(BaseModel): id: str = Field(default_factory=lambda: str(uuid.uuid4())); account_name: str; email: EmailStr; password: str; sender_name: Optional[str] = ""; smtp_server: str; smtp_port: int; connection_type: str; use_ssl: bool = False; use_starttls: bool = True; signature_html: Optional[str] = ""
 class SendingParams(BaseModel): batchSize: int = 10; delay: float = 5.0; subjectRotation: int = 10; emailsPerAccount: int = 5
-class AppConfig(BaseModel): emailAccounts: List[EmailAccount] = Field(default_factory=list, alias="emailAccounts"); subjectLines: List[str] = Field(default_factory=list, alias="subjectLines"); sendingParams: SendingParams = Field(default_factory=SendingParams, alias="sendingParams")
-class Recipient(BaseModel): id: str; sl_no: int; Email: EmailStr; FirstName: Optional[str] = ""; CompanyName: Optional[str] = ""; STATUS: Optional[str] = "Pending"
+class AppConfig(BaseModel): emailAccounts: List[EmailAccount] = Field(default_factory=list); subjectLines: List[str] = Field(default_factory=list); sendingParams: SendingParams = Field(default_factory=SendingParams)
+# FIX: Changed 'STATUS' to 'status' to match the frontend JSON payload
+class Recipient(BaseModel): id: str; sl_no: int; Email: EmailStr; FirstName: Optional[str] = ""; CompanyName: Optional[str] = ""; status: Optional[str] = "Pending"
 class CampaignRequest(BaseModel): selected_accounts: List[str]; selected_subjects: List[str]; recipients: List[Recipient]; email_body_template: str; sending_params: SendingParams
 class TrialCampaignRequest(BaseModel): selected_accounts: List[EmailAccount]; selected_subjects: List[str]; recipients: List[Recipient]; email_body_template: str; sending_params: SendingParams; trial_id: str
 
@@ -92,9 +106,12 @@ async def get_current_user(request: Request) -> User:
     try:
         decoded_token = auth.verify_id_token(id_token)
         uid = decoded_token.get("uid")
-        if not uid: raise HTTPException(status_code=401, detail="Invalid token")
+        if not uid: raise HTTPException(status_code=401, detail="Invalid token: UID not found")
         return User(uid=uid, email=decoded_token.get("email"))
-    except Exception as e: raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    except auth.InvalidIdTokenError:
+        raise HTTPException(status_code=401, detail="Invalid ID token")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {e}")
 
 def spin(text: str) -> str:
     pattern = re.compile(r'{([^{}]*)}')
@@ -111,8 +128,8 @@ def _hash_full_code(code_str: str) -> str:
     return hashlib.sha256(code_str.encode('utf-8')).hexdigest()
 
 class LicenseService:
-    def _get_user_license_doc_ref(self, user_id: str, db_client): return db_client.collection("artifacts").document("mail_sender_ros_backend_app_id").collection("users").document(user_id).collection("userAppData").document("license")
-    def _get_consumed_codes_doc_ref(self, db_client): return db_client.collection("artifacts").document("mail_sender_ros_backend_app_id").collection("userAppData").document("consumedCodes")
+    def _get_user_license_doc_ref(self, user_id: str, db_client): return db_client.collection(ARTIFACTS_COLLECTION).document(BACKEND_APP_ID).collection("users").document(user_id).collection(USER_DATA_SUBCOLLECTION).document(LICENSE_DOC_ID)
+    def _get_consumed_codes_doc_ref(self, db_client): return db_client.collection(ARTIFACTS_COLLECTION).document(BACKEND_APP_ID).collection(USER_DATA_SUBCOLLECTION).document(CONSUMED_CODES_DOC_ID)
     def get_license_status_sync(self, user_id: str, db_client) -> LicenseStatus:
         doc = self._get_user_license_doc_ref(user_id, db_client).get()
         if doc.exists: return LicenseStatus(**doc.to_dict())
@@ -144,20 +161,22 @@ class LicenseService:
         self._get_user_license_doc_ref(uid, db_client).set(new_license_data)
         if consumed_doc.exists: consumed_ref.update({"codes": firestore.ArrayUnion([code_hash])})
         else: consumed_ref.set({"codes": [code_hash]})
-        return {"uid": uid, "idToken": auth.create_custom_token(uid).decode('utf-8'), "license": new_license_data}
+        # FIX: The custom token needs to be returned as a string, not bytes.
+        return {"uid": uid, "idToken": auth.create_custom_token(uid), "license": new_license_data}
 
 class ConfigService:
-    def _get_user_config_doc_ref(self, user_id: str, db_client): return db_client.collection("artifacts").document("mail_sender_ros_backend_app_id").collection("users").document(user_id).collection("userAppData").document("appConfig")
+    def _get_user_config_doc_ref(self, user_id: str, db_client): return db_client.collection(ARTIFACTS_COLLECTION).document(BACKEND_APP_ID).collection("users").document(user_id).collection(USER_DATA_SUBCOLLECTION).document(APP_CONFIG_DOC_ID)
     def get_app_config_sync(self, user_id: str, db_client) -> AppConfig:
         doc = self._get_user_config_doc_ref(user_id, db_client).get()
         if doc.exists: return AppConfig(**doc.to_dict())
         return AppConfig()
     def save_app_config_sync(self, user_id: str, config_data: AppConfig, db_client):
+        # FIX: Pydantic v2 uses model_dump, not dict
         self._get_user_config_doc_ref(user_id, db_client).set(config_data.model_dump(by_alias=True))
         return config_data
 
 class EmailService:
-    def _log_to_console(self, user_id: str, message: str): print(f"UID/TrialID: {user_id} | {message}")
+    def _log_to_console(self, user_or_campaign_id: str, message: str): print(f"ID: {user_or_campaign_id} | {message}")
     
     def _send_single_email(self, account_config: dict, to_email: str, subject: str, body: str):
         try:
@@ -175,81 +194,113 @@ class EmailService:
             return True, "Sent"
         except Exception as e: return False, str(e)
 
-    def _process_campaign_in_background(self, req: Any, user_id_or_trial_id: str, db_client: Any, is_trial: bool):
-        self._log_to_console(user_id_or_trial_id, "BG processing started.")
+    def _process_campaign_in_background(self, req: Any, campaign_id: str, db_client: Any, is_trial: bool, user_id: Optional[str] = None):
+        self._log_to_console(campaign_id, "BG processing started.")
+        campaign_doc_ref = db_client.collection(CAMPAIGN_COLLECTION).document(campaign_id)
         
+        # Initial recipients update
+        recipients_for_update = [r.model_dump() for r in req.recipients]
+        campaign_doc_ref.set({"recipients": recipients_for_update})
+
         if is_trial:
             active_accounts = [acc.model_dump() for acc in req.selected_accounts]
+            trial_doc_ref = db_client.collection(TRIAL_DATA_COLLECTION).document(req.trial_id)
         else:
-            user_config = ConfigService().get_app_config_sync(user_id_or_trial_id, db_client)
+            if not user_id: self._log_to_console(campaign_id, "ERROR: User ID is required for non-trial campaigns."); return
+            user_config = ConfigService().get_app_config_sync(user_id, db_client)
             available_accounts = {acc.account_name: acc.model_dump() for acc in user_config.emailAccounts}
             active_accounts = [available_accounts[name] for name in req.selected_accounts if name in available_accounts]
 
-        if not active_accounts: self._log_to_console(user_id_or_trial_id, "No valid accounts."); return
-            
+        if not active_accounts: self._log_to_console(campaign_id, "No valid accounts."); return
+        
         active_subjects = req.selected_subjects or ["Default Subject"]
         current_account_index, total_sent = 0, 0
-        trial_doc_ref = db_client.collection(TRIAL_DATA_COLLECTION).document(user_id_or_trial_id) if is_trial else None
 
-        for recipient in req.recipients:
+        for i, recipient in enumerate(req.recipients):
             if is_trial:
                 trial_doc = trial_doc_ref.get()
                 emails_sent_count = trial_doc.to_dict().get('emails_sent', 0) if trial_doc.exists else 0
-                if emails_sent_count >= TRIAL_MAX_EMAILS: self._log_to_console(user_id_or_trial_id, "TRIAL limit reached."); break
+                if emails_sent_count >= TRIAL_MAX_EMAILS: self._log_to_console(campaign_id, "TRIAL limit reached."); break
             
+            # Update status to Processing in Firestore
+            campaign_doc_ref.update({f'recipients.{i}.status': 'Processing...'})
+
             account_dict = active_accounts[current_account_index]
-            processed_subject = spin(active_subjects[0])
+            processed_subject = spin(random.choice(active_subjects))
             processed_body = spin(req.email_body_template)
             
             placeholders = {"{{FirstName}}": recipient.FirstName or "", "{{CompanyName}}": recipient.CompanyName or "", "{{Email}}": recipient.Email, "{{SENDER_NAME}}": account_dict.get("sender_name") or account_dict.get("email")}
             for ph, val in placeholders.items():
                 processed_subject, processed_body = processed_subject.replace(ph, val), processed_body.replace(ph, val)
             
-            success, status = self._send_single_email(account_dict, recipient.Email, processed_subject, processed_body)
+            success, status_msg = self._send_single_email(account_dict, recipient.Email, processed_subject, processed_body)
             
+            # Update status after sending attempt
+            campaign_doc_ref.update({f'recipients.{i}.status': status_msg})
+
             if success:
-                self._log_to_console(user_id_or_trial_id, f"SUCCESS sending to {recipient.Email}")
+                self._log_to_console(campaign_id, f"SUCCESS sending to {recipient.Email}")
                 total_sent += 1
                 if is_trial: trial_doc_ref.set({'emails_sent': firestore.Increment(1)}, merge=True)
             else:
-                self._log_to_console(user_id_or_trial_id, f"ERROR sending to {recipient.Email}: {status}")
+                self._log_to_console(campaign_id, f"ERROR sending to {recipient.Email}: {status_msg}")
 
             current_account_index = (current_account_index + 1) % len(active_accounts)
             time.sleep(req.sending_params.delay)
-        self._log_to_console(user_id_or_trial_id, f"BG processing finished. Total sent: {total_sent}.")
+            
+        self._log_to_console(campaign_id, f"BG processing finished. Total sent: {total_sent}.")
 
 # --- Routers ---
-license_router, config_router, campaign_router = APIRouter(prefix="/api/license"), APIRouter(prefix="/api/config"), APIRouter(prefix="/api/send")
+# FIX: Renamed router prefix to /api/campaign and /api/config to match frontend calls
+api_router = APIRouter(prefix="/api")
+license_router = APIRouter(prefix="/license", tags=["License"])
+config_router = APIRouter(prefix="/config", tags=["Configuration"])
+campaign_router = APIRouter(prefix="/campaign", tags=["Campaign"])
+
 license_service_instance, config_service_instance, email_service_instance = LicenseService(), ConfigService(), EmailService()
 
 @license_router.post("/activate-noauth")
 def activate_no_auth(req: ActivationRequest, db_client=Depends(get_db)):
     return license_service_instance.activate_license_for_new_user_sync(req.activation_code, db_client)
+
 @license_router.get("/status", response_model=LicenseStatus)
 def get_license_status(user: User = Depends(get_current_user), db_client=Depends(get_db)):
     return license_service_instance.get_license_status_sync(user.uid, db_client)
+
 @config_router.get("", response_model=AppConfig)
 def get_config(user: User = Depends(get_current_user), db_client=Depends(get_db)):
     return config_service_instance.get_app_config_sync(user.uid, db_client)
+
 @config_router.post("")
 def save_config(data: AppConfig, user: User = Depends(get_current_user), db_client=Depends(get_db)):
     return config_service_instance.save_app_config_sync(user.uid, data, db_client)
 
-@campaign_router.post("/campaign")
+# FIX: Renamed endpoint to /start to match new router structure
+@campaign_router.post("/start")
 def start_campaign(req: CampaignRequest, bg_tasks: BackgroundTasks, user: User = Depends(get_current_user), db_client=Depends(get_db)):
-    bg_tasks.add_task(email_service_instance._process_campaign_in_background, req, user.uid, db_client, is_trial=False, license_service=license_service_instance)
-    return {"message": "Campaign for activated user has been started."}
-@campaign_router.post("/trial-campaign")
+    campaign_id = str(uuid.uuid4())
+    bg_tasks.add_task(email_service_instance._process_campaign_in_background, req, campaign_id, db_client, is_trial=False, user_id=user.uid)
+    return {"message": "Campaign for activated user has been started.", "campaign_id": campaign_id}
+
+# FIX: Renamed endpoint to /start-trial to match frontend call
+@campaign_router.post("/start-trial")
 def start_trial_campaign(req: TrialCampaignRequest, bg_tasks: BackgroundTasks, db_client=Depends(get_db)):
     trial_doc_ref = db_client.collection(TRIAL_DATA_COLLECTION).document(req.trial_id)
     trial_doc = trial_doc_ref.get()
     emails_sent = trial_doc.to_dict().get('emails_sent', 0) if trial_doc.exists else 0
     if emails_sent >= TRIAL_MAX_EMAILS:
         raise HTTPException(status_code=403, detail=f"Trial limit of {TRIAL_MAX_EMAILS} emails reached.")
-    bg_tasks.add_task(email_service_instance._process_campaign_in_background, req, req.trial_id, db_client, is_trial=True)
-    return {"message": f"Trial campaign started. You have sent {emails_sent} of {TRIAL_MAX_EMAILS} trial emails."}
+    
+    campaign_id = str(uuid.uuid4()) # Create a unique ID for the campaign
+    bg_tasks.add_task(email_service_instance._process_campaign_in_background, req, campaign_id, db_client, is_trial=True)
+    return {"message": f"Trial campaign started. You have sent {emails_sent} of {TRIAL_MAX_EMAILS} trial emails.", "campaign_id": campaign_id}
 
-app.include_router(license_router, tags=["License"]); app.include_router(config_router, tags=["Configuration"]); app.include_router(campaign_router, tags=["Campaign"])
+# Include all routers under the /api prefix
+api_router.include_router(license_router)
+api_router.include_router(config_router)
+api_router.include_router(campaign_router)
+app.include_router(api_router)
+
 @app.get("/")
 def root(): return {"message": f"{app.title} v{app.version} is running! DB status: {'OK' if db else 'Error'}"}
 
