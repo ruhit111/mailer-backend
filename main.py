@@ -46,16 +46,17 @@ async def lifespan(app: FastAPI):
     yield
     print("SHUTDOWN: Application is shutting down.")
 
+
 # --- FastAPI App Definition ---
-app = FastAPI(title="Mail Sender by ROS", version="7.0.0", lifespan=lifespan)
+app = FastAPI(title="Mail Sender by ROS", version="7.1.0", lifespan=lifespan)
 print("LOG: FastAPI app object created.")
 
 # --- Constants & Config ---
 APP_PREFIX = "BULKMAILER"
 SECRET_KEY = "R@O#S"
 TRIAL_MAX_EMAILS = 50
-ARTIFACTS_COLLECTION = "artifacts"
-BACKEND_APP_ID = "mail_sender_ros_backend_app_id"
+ARTIFACTS_COLLECTION = "artifacts" 
+BACKEND_APP_ID = "mail_sender_ros_backend_app_id" 
 USER_DATA_SUBCOLLECTION = "userAppData"
 LICENSE_DOC_ID = "license"
 CONSUMED_CODES_DOC_ID = "consumedCodes"
@@ -155,84 +156,73 @@ class ConfigService:
 
 class EmailService:
     def _log_to_console(self, user_id: str, message: str): print(f"UID/TrialID: {user_id} | {message}")
-
-    def _send_single_email(self, account_config: EmailAccount, to_email: str, subject: str, body: str):
-        """
-        Robust email sending logic adapted from the user's provided script.
-        This is a synchronous function to be run in a background thread.
-        """
+    
+    # ** THIS IS THE FIX: Using your proven email sending logic **
+    def _send_single_email(self, account_config: dict, to_email: str, subject: str, body: str):
         try:
             msg = MIMEMultipart("alternative")
             msg["Subject"] = Header(subject, "utf-8")
-            msg["From"] = formataddr((str(Header(account_config.sender_name, 'utf-8')), account_config.email))
+            from_name = account_config.get("sender_name") or account_config.get("email")
+            msg["From"] = formataddr((str(Header(from_name, 'utf-8')), account_config.get("email")))
             msg["To"] = to_email
             msg.attach(MIMEText(body, "html", "utf-8"))
 
             context = ssl.create_default_context()
-            if account_config.connection_type == "SSL":
-                server = smtplib.SMTP_SSL(account_config.smtp_server, account_config.smtp_port, context=context, timeout=60)
+            if account_config.get("connection_type") == "SSL":
+                server = smtplib.SMTP_SSL(account_config.get("smtp_server"), account_config.get("smtp_port"), context=context, timeout=60)
             else: # STARTTLS or None
-                server = smtplib.SMTP(account_config.smtp_server, account_config.smtp_port, timeout=60)
-                if account_config.connection_type == "STARTTLS":
+                server = smtplib.SMTP(account_config.get("smtp_server"), account_config.get("smtp_port"), timeout=60)
+                if account_config.get("connection_type") == "STARTTLS":
                     server.starttls(context=context)
 
-            server.login(account_config.email, account_config.password)
-            server.sendmail(account_config.email, [to_email], msg.as_string())
+            server.login(account_config.get("email"), account_config.get("password"))
+            server.sendmail(account_config.get("email"), [to_email], msg.as_string())
             server.quit()
             return True, "Sent"
         except Exception as e:
             return False, str(e)
 
-
     async def _process_campaign_in_background(self, req: Any, user_id_or_trial_id: str, db_client: Any, is_trial: bool):
         self._log_to_console(user_id_or_trial_id, "BG processing started.")
-        
         if is_trial:
-            active_accounts = req.selected_accounts
+            active_accounts = [acc.model_dump() for acc in req.selected_accounts]
         else:
             user_config = await ConfigService().get_app_config(user_id_or_trial_id, db_client)
-            available_accounts = {acc.account_name: acc for acc in user_config.emailAccounts}
+            available_accounts = {acc.account_name: acc.model_dump() for acc in user_config.emailAccounts}
             active_accounts = [available_accounts[name] for name in req.selected_accounts if name in available_accounts]
 
-        if not active_accounts:
-            self._log_to_console(user_id_or_trial_id, "No valid accounts. Halting."); return
+        if not active_accounts: self._log_to_console(user_id_or_trial_id, "No valid accounts."); return
             
         active_subjects = req.selected_subjects or ["Default Subject"]
-        current_account_index, total_sent_this_campaign = 0, 0
+        current_account_index, total_sent = 0, 0
         trial_doc_ref = db_client.collection(TRIAL_DATA_COLLECTION).document(user_id_or_trial_id) if is_trial else None
 
         for recipient in req.recipients:
             if is_trial:
                 trial_doc = await trial_doc_ref.get()
                 emails_sent_count = trial_doc.to_dict().get('emails_sent', 0) if trial_doc.exists else 0
-                if emails_sent_count >= TRIAL_MAX_EMAILS:
-                    self._log_to_console(user_id_or_trial_id, "TRIAL limit reached. Stopping.")
-                    break
+                if emails_sent_count >= TRIAL_MAX_EMAILS: self._log_to_console(user_id_or_trial_id, "TRIAL limit reached."); break
             
-            account = active_accounts[current_account_index]
-            processed_subject = spin(active_subjects[0]) # Simple rotation for now
+            account_dict = active_accounts[current_account_index]
+            processed_subject = spin(active_subjects[0])
             processed_body = spin(req.email_body_template)
             
-            placeholders = {"{{FirstName}}": recipient.FirstName or "", "{{CompanyName}}": recipient.CompanyName or "", "{{Email}}": recipient.Email, "{{SENDER_NAME}}": account.sender_name or account.email}
+            placeholders = {"{{FirstName}}": recipient.FirstName or "", "{{CompanyName}}": recipient.CompanyName or "", "{{Email}}": recipient.Email, "{{SENDER_NAME}}": account_dict.get("sender_name") or account_dict.get("email")}
             for ph, val in placeholders.items():
-                processed_subject = processed_subject.replace(ph, val)
-                processed_body = processed_body.replace(ph, val)
+                processed_subject, processed_body = processed_subject.replace(ph, val), processed_body.replace(ph, val)
             
-            success, status = self._send_single_email(account, recipient.Email, processed_subject, processed_body)
+            success, status = self._send_single_email(account_dict, recipient.Email, processed_subject, processed_body)
             
             if success:
                 self._log_to_console(user_id_or_trial_id, f"SUCCESS sending to {recipient.Email}")
-                total_sent_this_campaign += 1
-                if is_trial:
-                    await trial_doc_ref.set({'emails_sent': firestore.Increment(1)}, merge=True)
+                total_sent += 1
+                if is_trial: await trial_doc_ref.set({'emails_sent': firestore.Increment(1)}, merge=True)
             else:
                 self._log_to_console(user_id_or_trial_id, f"ERROR sending to {recipient.Email}: {status}")
 
             current_account_index = (current_account_index + 1) % len(active_accounts)
             time.sleep(req.sending_params.delay)
-
-        self._log_to_console(user_id_or_trial_id, f"BG processing finished. Total sent: {total_sent_this_campaign}.")
-
+        self._log_to_console(user_id_or_trial_id, f"BG processing finished. Total sent: {total_sent}.")
 
     async def start_send_bulk_emails(self, req: CampaignRequest, uid: str, db_client, bg_tasks: BackgroundTasks):
         bg_tasks.add_task(self._process_campaign_in_background, req, uid, db_client, is_trial=False)
@@ -242,9 +232,7 @@ class EmailService:
         trial_doc_ref = db_client.collection(TRIAL_DATA_COLLECTION).document(req.trial_id)
         trial_doc = await trial_doc_ref.get()
         emails_sent = trial_doc.to_dict().get('emails_sent', 0) if trial_doc.exists else 0
-        if emails_sent >= TRIAL_MAX_EMAILS:
-            raise HTTPException(status_code=403, detail=f"Trial limit of {TRIAL_MAX_EMAILS} emails reached.")
-        
+        if emails_sent >= TRIAL_MAX_EMAILS: raise HTTPException(status_code=403, detail=f"Trial limit of {TRIAL_MAX_EMAILS} emails reached.")
         bg_tasks.add_task(self._process_campaign_in_background, req, req.trial_id, db_client, is_trial=True)
         return {"message": f"Trial campaign started. You have sent {emails_sent} of {TRIAL_MAX_EMAILS} trial emails."}
 
@@ -260,10 +248,9 @@ async def get_license_status(user: User = Depends(get_current_user), db_client=D
 async def get_config(user: User = Depends(get_current_user), db_client=Depends(get_db)): return await config_service.get_app_config(user.uid, db_client)
 @config_router.post("")
 async def save_config(data: AppConfig, user: User = Depends(get_current_user), db_client=Depends(get_db)): return await config_service.save_app_config(user.uid, data, db_client)
-
 @campaign_router.post("/campaign")
 async def start_campaign(req: CampaignRequest, bg_tasks: BackgroundTasks, user: User = Depends(get_current_user), db_client=Depends(get_db)):
-    return await email_service.start_send_bulk_emails(req, user.uid, license_service, db_client, bg_tasks)
+    return await email_service.start_send_bulk_emails(req, user.uid, db_client, bg_tasks)
 @campaign_router.post("/trial-campaign")
 async def start_trial_campaign(req: TrialCampaignRequest, bg_tasks: BackgroundTasks, db_client=Depends(get_db)):
     return await email_service.start_trial_send(req, db_client, bg_tasks)
