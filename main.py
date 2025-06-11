@@ -1,4 +1,4 @@
-# main.py - FINAL BUG FIX (Corrects Background Task Arguments)
+# main.py - FINAL BUG FIX (Corrects Background Task Arguments for Trial Mode)
 
 import os
 import json
@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
 
 
 # --- FastAPI App Definition ---
-app = FastAPI(title="Mail Sender by ROS", version="7.2.0", lifespan=lifespan)
+app = FastAPI(title="Mail Sender by ROS", version="7.4.0", lifespan=lifespan)
 print("LOG: FastAPI app object created.")
 
 # --- Constants & Config ---
@@ -181,7 +181,7 @@ class EmailService:
         except Exception as e:
             return False, str(e)
 
-    async def _process_campaign_in_background(self, req: Any, user_id_or_trial_id: str, db_client: Any, license_service: Any, is_trial: bool):
+    async def _process_campaign_in_background(self, req: Any, user_id_or_trial_id: str, db_client: Any, is_trial: bool, license_service: Optional[LicenseService] = None):
         self._log_to_console(user_id_or_trial_id, "BG processing started.")
         
         if is_trial:
@@ -202,7 +202,7 @@ class EmailService:
                 trial_doc = await trial_doc_ref.get()
                 emails_sent_count = trial_doc.to_dict().get('emails_sent', 0) if trial_doc.exists else 0
                 if emails_sent_count >= TRIAL_MAX_EMAILS: self._log_to_console(user_id_or_trial_id, "TRIAL limit reached."); break
-            else: # Check activated user license
+            else: 
                 license_status = await license_service.get_license_status(user_id_or_trial_id, db_client)
                 if license_status.status != "ACTIVE": self._log_to_console(user_id_or_trial_id, "User is not active. Stopping."); break
 
@@ -231,12 +231,15 @@ class EmailService:
         bg_tasks.add_task(self._process_campaign_in_background, req, uid, db_client, license_service, is_trial=False)
         return {"message": "Campaign for activated user has been started."}
 
-    async def start_trial_send(self, req: TrialCampaignRequest, license_service: LicenseService, db_client, bg_tasks: BackgroundTasks):
+    async def start_trial_send(self, req: TrialCampaignRequest, db_client, bg_tasks: BackgroundTasks):
         trial_doc_ref = db_client.collection(TRIAL_DATA_COLLECTION).document(req.trial_id)
         trial_doc = await trial_doc_ref.get()
         emails_sent = trial_doc.to_dict().get('emails_sent', 0) if trial_doc.exists else 0
         if emails_sent >= TRIAL_MAX_EMAILS: raise HTTPException(status_code=403, detail=f"Trial limit of {TRIAL_MAX_EMAILS} emails reached.")
-        bg_tasks.add_task(self._process_campaign_in_background, req, req.trial_id, db_client, license_service, is_trial=True)
+        
+        # ** THE FIX IS HERE **
+        # The 'license_service' argument is removed as it's not needed for trials.
+        bg_tasks.add_task(self._process_campaign_in_background, req, req.trial_id, db_client, is_trial=True)
         return {"message": f"Trial campaign started. You have sent {emails_sent} of {TRIAL_MAX_EMAILS} trial emails."}
 
 # --- Routers ---
@@ -257,11 +260,12 @@ async def start_campaign(req: CampaignRequest, bg_tasks: BackgroundTasks, user: 
     return await email_service_instance.start_send_bulk_emails(req, user.uid, license_service_instance, db_client, bg_tasks)
 @campaign_router.post("/trial-campaign")
 async def start_trial_campaign(req: TrialCampaignRequest, bg_tasks: BackgroundTasks, db_client=Depends(get_db)):
-    return await email_service_instance.start_trial_send(req, license_service_instance, db_client, bg_tasks)
+    # ** THE FIX IS HERE **
+    # We no longer pass the license_service_instance to the trial sender.
+    return await email_service_instance.start_trial_send(req, db_client, bg_tasks)
 
 app.include_router(license_router, tags=["License"]); app.include_router(config_router, tags=["Configuration"]); app.include_router(campaign_router, tags=["Campaign"])
 @app.get("/")
 async def root(): return {"message": f"{app.title} v{app.version} is running! DB status: {'OK' if db else 'Error'}"}
 
 print("LOG: main.py script execution finished.")
-
