@@ -1,3 +1,5 @@
+# main.py - FINAL BUG FIX (Corrects Background Task Arguments)
+
 import os
 import json
 import hashlib
@@ -48,7 +50,7 @@ async def lifespan(app: FastAPI):
 
 
 # --- FastAPI App Definition ---
-app = FastAPI(title="Mail Sender by ROS", version="7.1.0", lifespan=lifespan)
+app = FastAPI(title="Mail Sender by ROS", version="7.2.0", lifespan=lifespan)
 print("LOG: FastAPI app object created.")
 
 # --- Constants & Config ---
@@ -157,7 +159,6 @@ class ConfigService:
 class EmailService:
     def _log_to_console(self, user_id: str, message: str): print(f"UID/TrialID: {user_id} | {message}")
     
-    # ** THIS IS THE FIX: Using your proven email sending logic **
     def _send_single_email(self, account_config: dict, to_email: str, subject: str, body: str):
         try:
             msg = MIMEMultipart("alternative")
@@ -166,15 +167,13 @@ class EmailService:
             msg["From"] = formataddr((str(Header(from_name, 'utf-8')), account_config.get("email")))
             msg["To"] = to_email
             msg.attach(MIMEText(body, "html", "utf-8"))
-
             context = ssl.create_default_context()
             if account_config.get("connection_type") == "SSL":
                 server = smtplib.SMTP_SSL(account_config.get("smtp_server"), account_config.get("smtp_port"), context=context, timeout=60)
-            else: # STARTTLS or None
+            else:
                 server = smtplib.SMTP(account_config.get("smtp_server"), account_config.get("smtp_port"), timeout=60)
                 if account_config.get("connection_type") == "STARTTLS":
                     server.starttls(context=context)
-
             server.login(account_config.get("email"), account_config.get("password"))
             server.sendmail(account_config.get("email"), [to_email], msg.as_string())
             server.quit()
@@ -182,8 +181,9 @@ class EmailService:
         except Exception as e:
             return False, str(e)
 
-    async def _process_campaign_in_background(self, req: Any, user_id_or_trial_id: str, db_client: Any, is_trial: bool):
+    async def _process_campaign_in_background(self, req: Any, user_id_or_trial_id: str, db_client: Any, license_service: Any, is_trial: bool):
         self._log_to_console(user_id_or_trial_id, "BG processing started.")
+        
         if is_trial:
             active_accounts = [acc.model_dump() for acc in req.selected_accounts]
         else:
@@ -202,7 +202,10 @@ class EmailService:
                 trial_doc = await trial_doc_ref.get()
                 emails_sent_count = trial_doc.to_dict().get('emails_sent', 0) if trial_doc.exists else 0
                 if emails_sent_count >= TRIAL_MAX_EMAILS: self._log_to_console(user_id_or_trial_id, "TRIAL limit reached."); break
-            
+            else: # Check activated user license
+                license_status = await license_service.get_license_status(user_id_or_trial_id, db_client)
+                if license_status.status != "ACTIVE": self._log_to_console(user_id_or_trial_id, "User is not active. Stopping."); break
+
             account_dict = active_accounts[current_account_index]
             processed_subject = spin(active_subjects[0])
             processed_body = spin(req.email_body_template)
@@ -224,39 +227,41 @@ class EmailService:
             time.sleep(req.sending_params.delay)
         self._log_to_console(user_id_or_trial_id, f"BG processing finished. Total sent: {total_sent}.")
 
-    async def start_send_bulk_emails(self, req: CampaignRequest, uid: str, db_client, bg_tasks: BackgroundTasks):
-        bg_tasks.add_task(self._process_campaign_in_background, req, uid, db_client, is_trial=False)
+    async def start_send_bulk_emails(self, req: CampaignRequest, uid: str, license_service: LicenseService, db_client, bg_tasks: BackgroundTasks):
+        bg_tasks.add_task(self._process_campaign_in_background, req, uid, db_client, license_service, is_trial=False)
         return {"message": "Campaign for activated user has been started."}
 
-    async def start_trial_send(self, req: TrialCampaignRequest, db_client, bg_tasks: BackgroundTasks):
+    async def start_trial_send(self, req: TrialCampaignRequest, license_service: LicenseService, db_client, bg_tasks: BackgroundTasks):
         trial_doc_ref = db_client.collection(TRIAL_DATA_COLLECTION).document(req.trial_id)
         trial_doc = await trial_doc_ref.get()
         emails_sent = trial_doc.to_dict().get('emails_sent', 0) if trial_doc.exists else 0
         if emails_sent >= TRIAL_MAX_EMAILS: raise HTTPException(status_code=403, detail=f"Trial limit of {TRIAL_MAX_EMAILS} emails reached.")
-        bg_tasks.add_task(self._process_campaign_in_background, req, req.trial_id, db_client, is_trial=True)
+        bg_tasks.add_task(self._process_campaign_in_background, req, req.trial_id, db_client, license_service, is_trial=True)
         return {"message": f"Trial campaign started. You have sent {emails_sent} of {TRIAL_MAX_EMAILS} trial emails."}
 
 # --- Routers ---
 license_router, config_router, campaign_router = APIRouter(prefix="/api/license"), APIRouter(prefix="/api/config"), APIRouter(prefix="/api/send")
-license_service, config_service, email_service = LicenseService(), ConfigService(), EmailService()
+license_service_instance, config_service_instance, email_service_instance = LicenseService(), ConfigService(), EmailService()
 
 @license_router.post("/activate-noauth")
-async def activate_no_auth(req: ActivationRequest, db_client=Depends(get_db)): return await license_service.activate_license_for_new_user(req.activation_code, db_client)
+async def activate_no_auth(req: ActivationRequest, db_client=Depends(get_db)): return await license_service_instance.activate_license_for_new_user(req.activation_code, db_client)
 @license_router.get("/status", response_model=LicenseStatus)
-async def get_license_status(user: User = Depends(get_current_user), db_client=Depends(get_db)): return await license_service.get_license_status(user.uid, db_client)
+async def get_license_status(user: User = Depends(get_current_user), db_client=Depends(get_db)): return await license_service_instance.get_license_status(user.uid, db_client)
 @config_router.get("", response_model=AppConfig)
-async def get_config(user: User = Depends(get_current_user), db_client=Depends(get_db)): return await config_service.get_app_config(user.uid, db_client)
+async def get_config(user: User = Depends(get_current_user), db_client=Depends(get_db)): return await config_service_instance.get_app_config(user.uid, db_client)
 @config_router.post("")
-async def save_config(data: AppConfig, user: User = Depends(get_current_user), db_client=Depends(get_db)): return await config_service.save_app_config(user.uid, data, db_client)
+async def save_config(data: AppConfig, user: User = Depends(get_current_user), db_client=Depends(get_db)): return await config_service_instance.save_app_config(user.uid, data, db_client)
+
 @campaign_router.post("/campaign")
 async def start_campaign(req: CampaignRequest, bg_tasks: BackgroundTasks, user: User = Depends(get_current_user), db_client=Depends(get_db)):
-    return await email_service.start_send_bulk_emails(req, user.uid, db_client, bg_tasks)
+    return await email_service_instance.start_send_bulk_emails(req, user.uid, license_service_instance, db_client, bg_tasks)
 @campaign_router.post("/trial-campaign")
 async def start_trial_campaign(req: TrialCampaignRequest, bg_tasks: BackgroundTasks, db_client=Depends(get_db)):
-    return await email_service.start_trial_send(req, db_client, bg_tasks)
+    return await email_service_instance.start_trial_send(req, license_service_instance, db_client, bg_tasks)
 
 app.include_router(license_router, tags=["License"]); app.include_router(config_router, tags=["Configuration"]); app.include_router(campaign_router, tags=["Campaign"])
 @app.get("/")
 async def root(): return {"message": f"{app.title} v{app.version} is running! DB status: {'OK' if db else 'Error'}"}
 
 print("LOG: main.py script execution finished.")
+
