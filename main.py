@@ -1,4 +1,4 @@
-# main.py - FINAL FIX (Corrects Race Condition and Cleans Console Logs)
+# main.py - FINAL FIX (Replicates Desktop App Logging and Behavior)
 
 import os
 import json
@@ -36,7 +36,6 @@ async def lifespan(app: FastAPI):
     try:
         if not firebase_admin._apps:
             print("STARTUP: Initializing Firebase Admin SDK...")
-            # Using a service account file is more common for Render deployments
             service_account_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
             if not service_account_path or not os.path.exists(service_account_path):
                  raise ValueError("CRITICAL_ERROR: GOOGLE_APPLICATION_CREDENTIALS env var not found or file does not exist.")
@@ -49,13 +48,13 @@ async def lifespan(app: FastAPI):
         print("STARTUP: Firestore client is ready.")
     except Exception as e:
         print(f"CRITICAL STARTUP ERROR: {e}")
-        db = None # Ensure db is None if initialization fails
+        db = None
     yield
     print("SHUTDOWN: Application is shutting down.")
 
 
 # --- FastAPI App Definition ---
-app = FastAPI(title="Mail Sender by ROS", version="8.2.0", lifespan=lifespan)
+app = FastAPI(title="Mail Sender by ROS", version="9.0.0", lifespan=lifespan)
 print("LOG: FastAPI app object created.")
 
 # --- Constants & Config ---
@@ -69,7 +68,7 @@ LICENSE_DOC_ID = "license"
 CONSUMED_CODES_DOC_ID = "consumedCodes"
 APP_CONFIG_DOC_ID = "appConfig"
 TRIAL_DATA_COLLECTION = "trials"
-CAMPAIGN_COLLECTION = "campaigns" # Collection for real-time updates
+CAMPAIGN_COLLECTION = "campaigns"
 
 # --- CORS Middleware ---
 app.add_middleware(
@@ -208,6 +207,10 @@ class EmailService:
         
         active_subjects = req.selected_subjects or ["Default Subject"]
         current_account_index, total_sent = 0, 0
+        
+        # Use a batch to update Firestore to avoid too many writes per second
+        batch = db_client.batch()
+        update_counter = 0
 
         for i, recipient in enumerate(req.recipients):
             if is_trial:
@@ -217,10 +220,9 @@ class EmailService:
                     self._log_to_console(campaign_id, "TRIAL limit reached.")
                     break
             
-            campaign_doc_ref.update({f'recipients.{i}.status': 'Processing...'})
-            
-            # FIX: Only log the "sending to" message to the console
-            self._log_to_console(campaign_id, f"Sending email to {recipient.Email}")
+            # This status is now set on the frontend log based on Firestore changes
+            # self._log_to_console(campaign_id, f"Sending email to {recipient.Email}")
+            batch.update(campaign_doc_ref, {f'recipients.{i}.status': 'Processing...'})
 
             account_dict = active_accounts[current_account_index]
             processed_subject = spin(random.choice(active_subjects))
@@ -232,16 +234,24 @@ class EmailService:
             
             success, status_msg = self._send_single_email(account_dict, recipient.Email, processed_subject, processed_body)
             
-            campaign_doc_ref.update({f'recipients.{i}.status': status_msg})
+            batch.update(campaign_doc_ref, {f'recipients.{i}.status': status_msg})
+            update_counter += 2
 
             if success:
                 total_sent += 1
-                if is_trial: trial_doc_ref.set({'emails_sent': firestore.Increment(1)}, merge=True)
+                if is_trial: batch.set(trial_doc_ref, {'emails_sent': firestore.Increment(1)}, merge=True)
+            
+            # Commit the batch periodically
+            if update_counter >= 400: # Firestore limit is 500 writes per batch
+                batch.commit()
+                batch = db_client.batch() # Start a new batch
+                update_counter = 0
 
             current_account_index = (current_account_index + 1) % len(active_accounts)
             time.sleep(req.sending_params.delay)
             
-        campaign_doc_ref.update({"status": "Completed"})
+        batch.update(campaign_doc_ref, {"status": "Completed"})
+        batch.commit() # Commit any remaining updates
         self._log_to_console(campaign_id, f"BG processing finished. Total sent: {total_sent}.")
 
 # --- Routers ---
