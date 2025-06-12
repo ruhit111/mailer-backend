@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
 
 
 # --- FastAPI App Definition ---
-app = FastAPI(title="Mail Sender by ROS", version="9.0.0", lifespan=lifespan)
+app = FastAPI(title="Mail Sender by ROS", version="9.1.0", lifespan=lifespan)
 print("LOG: FastAPI app object created.")
 
 # --- Constants & Config ---
@@ -208,7 +208,6 @@ class EmailService:
         active_subjects = req.selected_subjects or ["Default Subject"]
         current_account_index, total_sent = 0, 0
         
-        # Use a batch to update Firestore to avoid too many writes per second
         batch = db_client.batch()
         update_counter = 0
 
@@ -220,11 +219,15 @@ class EmailService:
                     self._log_to_console(campaign_id, "TRIAL limit reached.")
                     break
             
-            # This status is now set on the frontend log based on Firestore changes
-            # self._log_to_console(campaign_id, f"Sending email to {recipient.Email}")
-            batch.update(campaign_doc_ref, {f'recipients.{i}.status': 'Processing...'})
-
             account_dict = active_accounts[current_account_index]
+            
+            # Add sending details to the batch update for 'Processing...' status
+            batch.update(campaign_doc_ref, {
+                f'recipients.{i}.status': 'Processing...',
+                f'recipients.{i}.sendingAccount': account_dict.get("email"),
+                f'recipients.{i}.senderName': account_dict.get("sender_name") or account_dict.get("email")
+            })
+
             processed_subject = spin(random.choice(active_subjects))
             processed_body = spin(req.email_body_template)
             
@@ -241,17 +244,16 @@ class EmailService:
                 total_sent += 1
                 if is_trial: batch.set(trial_doc_ref, {'emails_sent': firestore.Increment(1)}, merge=True)
             
-            # Commit the batch periodically
-            if update_counter >= 400: # Firestore limit is 500 writes per batch
+            if update_counter >= 400:
                 batch.commit()
-                batch = db_client.batch() # Start a new batch
+                batch = db_client.batch()
                 update_counter = 0
 
             current_account_index = (current_account_index + 1) % len(active_accounts)
             time.sleep(req.sending_params.delay)
             
         batch.update(campaign_doc_ref, {"status": "Completed"})
-        batch.commit() # Commit any remaining updates
+        batch.commit()
         self._log_to_console(campaign_id, f"BG processing finished. Total sent: {total_sent}.")
 
 # --- Routers ---
@@ -283,7 +285,13 @@ def start_campaign(req: CampaignRequest, bg_tasks: BackgroundTasks, user: User =
     campaign_id = str(uuid.uuid4())
     campaign_doc_ref = db_client.collection(CAMPAIGN_COLLECTION).document(campaign_id)
     initial_recipients = [r.model_dump() for r in req.recipients]
-    campaign_doc_ref.set({"recipients": initial_recipients, "status": "Initializing...", "userId": user.uid, "createdAt": firestore.SERVER_TIMESTAMP})
+    campaign_doc_ref.set({
+        "recipients": initial_recipients,
+        "status": "Initializing...",
+        "userId": user.uid,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "sending_params": req.sending_params.model_dump()
+    })
     
     bg_tasks.add_task(email_service_instance._process_campaign_in_background, req, campaign_id, db_client, is_trial=False, user_id=user.uid)
     return {"message": "Campaign for activated user has been started.", "campaign_id": campaign_id}
@@ -300,7 +308,13 @@ def start_trial_campaign(req: TrialCampaignRequest, bg_tasks: BackgroundTasks, d
     campaign_doc_ref = db_client.collection(CAMPAIGN_COLLECTION).document(campaign_id)
     
     initial_recipients = [r.model_dump() for r in req.recipients]
-    campaign_doc_ref.set({"recipients": initial_recipients, "status": "Initializing...", "isTrial": True, "createdAt": firestore.SERVER_TIMESTAMP})
+    campaign_doc_ref.set({
+        "recipients": initial_recipients,
+        "status": "Initializing...",
+        "isTrial": True,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "sending_params": req.sending_params.model_dump()
+    })
     
     bg_tasks.add_task(email_service_instance._process_campaign_in_background, req, campaign_id, db_client, is_trial=True)
     return {"message": f"Trial campaign started. You have sent {emails_sent} of {TRIAL_MAX_EMAILS} trial emails.", "campaign_id": campaign_id}
